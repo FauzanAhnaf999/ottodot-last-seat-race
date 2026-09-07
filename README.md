@@ -1,5 +1,8 @@
 # Ottodot — Trial Booking (Capacity 4, Race-Safe)
 
+> **Video walkthrough (5–8 min):** https://drive.google.com/file/d/1Xha5JHv-n4WOdAWI_Eg157yMglUyflCY/view?usp=drive_link
+> **Repo:** https://github.com/FauzanAhnaf999/ottodot-last-seat-race
+
 Smallest working slice of Ottodot's trial booking system. Parents book a trial class for their child, pay (mock), and teachers see an accurate roster. Correctness under edge cases is prioritized over UI polish.
 
 Stack: **Next.js 16 (App Router) + React 19 + TypeScript + Tailwind 4 + Zod + Supabase/Postgres (schema + in-memory fallback) + Vercel-ready**.
