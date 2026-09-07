@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
 
     const { parent_id, student_id, trial_class_id } = parsed.data;
 
-    const result = store.createPendingBooking({ parent_id, student_id, trial_class_id });
+    const result = await store.createPendingBooking({ parent_id, student_id, trial_class_id });
 
     if ("error" in result) {
       throw new AppError(result.code as AppError["code"], result.error);
@@ -50,14 +50,36 @@ export async function GET(req: NextRequest) {
   try {
     const id = req.nextUrl.searchParams.get("id");
     if (id) {
-      const booking = store.getBooking(id);
+      const booking = await store.getBooking(id);
       if (!booking) throw new AppError("BOOKING_NOT_FOUND", "Booking not found");
-      const payments = store.getPaymentsForBooking(id);
+      const payments = await store.getPaymentsForBooking(id);
       return jsonOk({ booking, payments });
     }
-    // Best practice: never expose dump via GET without auth; use dedicated admin endpoint.
-    // For demo we return explicit error to avoid leaking (store as any) internals.
-    throw new AppError("BAD_REQUEST", "Use ?id=<bookingId> or GET /api/roster/[classId] or GET /api/seed for debug dump");
+    // Support per-child status check for UI clarity (best practice: resource-oriented filtering)
+    const studentId = req.nextUrl.searchParams.get("studentId") ?? req.nextUrl.searchParams.get("student_id");
+    const trialClassId = req.nextUrl.searchParams.get("trialClassId") ?? req.nextUrl.searchParams.get("trial_class_id");
+    const classId = req.nextUrl.searchParams.get("classId");
+    if (studentId && trialClassId) {
+      const bookings = await store.getBookingsForStudentClass(studentId, trialClassId);
+      return jsonOk({ bookings });
+    }
+    if (studentId) {
+      const all = (await store.getAllBookings()).filter((b) => b.student_id === studentId);
+      return jsonOk({ bookings: all });
+    }
+    if (classId) {
+      const bookings = await store.getBookingsForClass(classId);
+      // Return breakdown for UI: how many pending/confirmed/failed — never hide pending from child owner
+      const breakdown = {
+        confirmed: bookings.filter((b) => b.status === "confirmed").length,
+        pending_payment: bookings.filter((b) => b.status === "pending_payment").length,
+        payment_failed: bookings.filter((b) => b.status === "payment_failed").length,
+        cancelled: bookings.filter((b) => b.status === "cancelled").length,
+        total: bookings.length,
+      };
+      return jsonOk({ bookings, breakdown });
+    }
+    throw new AppError("BAD_REQUEST", "Use ?id=<bookingId> or ?studentId=&trialClassId= or ?classId= or GET /api/roster/[classId]");
   } catch (err) {
     return jsonError(err);
   }

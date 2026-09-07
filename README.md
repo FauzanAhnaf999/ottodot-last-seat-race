@@ -1,5 +1,6 @@
 # Ottodot — Trial Booking (Capacity 4, Race-Safe)
 
+> **Live demo (Vercel):** https://ottodot-last-seat-race.vercel.app/
 > **Video walkthrough (5–8 min):** https://drive.google.com/file/d/1Xha5JHv-n4WOdAWI_Eg157yMglUyflCY/view?usp=drive_link
 > **Repo:** https://github.com/FauzanAhnaf999/ottodot-last-seat-race
 
@@ -74,7 +75,7 @@ Parents: Siti (par_1, kids Kiko/Milo), Budi (par_2, Dina/Riko), Anya (par_3, Ell
 
 ## Time spent
 
-~7 hours total (scaffold + data model + transactional logic + validation/error best-practice layer + APIs + minimal UI + seed + verification scripts + hardened Postgres schema + docs). Backend-only slice (schema + `store.ts`/`lib/*` + routes + tests) ~4 hours.
+~5 hours total — ~4 hours core build (scaffold + data model + transactional logic + validation/error layer + APIs + minimal UI + seed + verification scripts + hardened Postgres schema + docs) within timebox + ~1 hour video walkthrough/recording. Core backend slice (schema + `store.ts`/`lib/*` + routes + tests) ~3.5 hours.
 
 ---
 

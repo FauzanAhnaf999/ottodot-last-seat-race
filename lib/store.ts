@@ -585,11 +585,222 @@ class InMemoryStore {
   }
 }
 
-// Singleton global store (persists across hot reloads in dev via globalThis)
+// In-memory singleton (fallback when Supabase not configured)
 const globalForStore = globalThis as unknown as { __ottodot_store?: InMemoryStore };
-
-export const store = globalForStore.__ottodot_store ?? new InMemoryStore();
+const memoryStore = globalForStore.__ottodot_store ?? new InMemoryStore();
 if (!globalForStore.__ottodot_store) {
-  globalForStore.__ottodot_store = store;
-  store.reset();
+  globalForStore.__ottodot_store = memoryStore;
+  memoryStore.reset();
 }
+
+// ---------------------------------------------------------------------------
+// Supabase-backed implementation (used when env configured — Vercel)
+// Keeps same invariants as InMemoryStore but persists across lambdas and
+// uses Postgres row-level locking via confirm_booking().
+// ---------------------------------------------------------------------------
+import { getSupabaseAdmin, isSupabaseConfigured } from "./supabase";
+
+async function sb() {
+  return getSupabaseAdmin();
+}
+
+async function supaCountConfirmed(classId: string): Promise<number> {
+  const c = await sb();
+  if (!c) return 0;
+  const { count, error } = await c.from("bookings").select("*", { count: "exact", head: true }).eq("trial_class_id", classId).eq("status", "confirmed");
+  if (error) throw error;
+  return count ?? 0;
+}
+
+async function supaGetTrialClasses(): Promise<TrialClassWithAvailability[]> {
+  const c = await sb();
+  if (!c) return memoryStore.getTrialClasses();
+  const { data, error } = await c.from("trial_classes").select("*");
+  if (error) throw error;
+  const out: TrialClassWithAvailability[] = [];
+  for (const tc of data as TrialClass[]) {
+    const cnt = await supaCountConfirmed(tc.id);
+    out.push({ ...tc, confirmed_count: cnt, available_seats: Math.max(0, tc.capacity - cnt), is_full: cnt >= tc.capacity });
+  }
+  return out;
+}
+
+async function supaGetTrialClass(id: string): Promise<TrialClassWithAvailability | null> {
+  const c = await sb();
+  if (!c) return memoryStore.getTrialClass(id);
+  const { data, error } = await c.from("trial_classes").select("*").eq("id", id).single();
+  if (error || !data) return null;
+  const cnt = await supaCountConfirmed(id);
+  const tc = data as TrialClass;
+  return { ...tc, confirmed_count: cnt, available_seats: Math.max(0, tc.capacity - cnt), is_full: cnt >= tc.capacity };
+}
+
+async function supaGetRoster(classId: string): Promise<RosterEntry[]> {
+  const c = await sb();
+  if (!c) return memoryStore.getRoster(classId);
+  const { data, error } = await c.from("bookings").select("*").eq("trial_class_id", classId).eq("status", "confirmed").order("created_at");
+  if (error) throw error;
+  const bookings = (data as Booking[]) ?? [];
+  if (bookings.length === 0) return [];
+  const studentIds = [...new Set(bookings.map((b) => b.student_id))];
+  const parentIds = [...new Set(bookings.map((b) => b.parent_id))];
+  const { data: students } = await c.from("students").select("*").in("id", studentIds);
+  const { data: parents } = await c.from("parents").select("*").in("id", parentIds);
+  const sMap = new Map((students as Student[] ?? []).map((s) => [s.id, s]));
+  const pMap = new Map((parents as Parent[] ?? []).map((p) => [p.id, p]));
+  return bookings.map((b) => ({ booking_id: b.id, student: sMap.get(b.student_id)!, parent: pMap.get(b.parent_id)!, booking_status: b.status, booked_at: b.created_at }));
+}
+
+// Unified store — async wrapper that delegates to Supabase when configured, else in-memory.
+// Keeps same method names so routes/pages stay unchanged except adding await.
+export const store = {
+  // sync reads become async when hitting Supabase
+  async getParents(): Promise<Parent[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getParents();
+    const c = await sb(); const { data, error } = await c!.from("parents").select("*");
+    if (error) throw error; return data as Parent[];
+  },
+  async getStudents(): Promise<Student[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getStudents();
+    const c = await sb(); const { data, error } = await c!.from("students").select("*");
+    if (error) throw error; return data as Student[];
+  },
+  async getStudentsByParent(parentId: string): Promise<Student[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getStudentsByParent(parentId);
+    const c = await sb(); const { data, error } = await c!.from("students").select("*").eq("parent_id", parentId);
+    if (error) throw error; return data as Student[];
+  },
+  async getTrialClasses(): Promise<TrialClassWithAvailability[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getTrialClasses();
+    return supaGetTrialClasses();
+  },
+  async getTrialClass(id: string): Promise<TrialClassWithAvailability | null> {
+    if (!isSupabaseConfigured()) return memoryStore.getTrialClass(id);
+    return supaGetTrialClass(id);
+  },
+  async getBooking(id: string): Promise<Booking | null> {
+    if (!isSupabaseConfigured()) return memoryStore.getBooking(id);
+    const c = await sb(); const { data, error } = await c!.from("bookings").select("*").eq("id", id).single();
+    if (error) return null; return data as Booking;
+  },
+  async getBookingsForClass(classId: string): Promise<Booking[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getBookingsForClass(classId);
+    const c = await sb(); const { data, error } = await c!.from("bookings").select("*").eq("trial_class_id", classId);
+    if (error) throw error; return data as Booking[];
+  },
+  async getBookingsForStudentClass(studentId: string, classId: string): Promise<Booking[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getBookingsForStudentClass(studentId, classId);
+    const c = await sb(); const { data, error } = await c!.from("bookings").select("*").eq("student_id", studentId).eq("trial_class_id", classId);
+    if (error) throw error; return data as Booking[];
+  },
+  async getAllBookings(): Promise<Booking[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getAllBookings();
+    const c = await sb(); const { data, error } = await c!.from("bookings").select("*");
+    if (error) throw error; return data as Booking[];
+  },
+  async getRoster(classId: string): Promise<RosterEntry[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getRoster(classId);
+    return supaGetRoster(classId);
+  },
+  async getPaymentsForBooking(bookingId: string): Promise<PaymentAttempt[]> {
+    if (!isSupabaseConfigured()) return memoryStore.getPaymentsForBooking(bookingId);
+    const c = await sb(); const { data, error } = await c!.from("payment_attempts").select("*").eq("booking_id", bookingId);
+    if (error) throw error; return data as PaymentAttempt[];
+  },
+  async countConfirmed(classId: string): Promise<number> {
+    if (!isSupabaseConfigured()) return memoryStore.countConfirmed(classId);
+    return supaCountConfirmed(classId);
+  },
+  async dump(): Promise<{ parents: Parent[]; students: Student[]; trialClasses: TrialClassWithAvailability[]; bookings: Booking[]; payments: PaymentAttempt[] }> {
+    if (!isSupabaseConfigured()) return memoryStore.dump() as any;
+    const c = await sb();
+    const [parents, students, classes, bookings, payments] = await Promise.all([
+      c!.from("parents").select("*"), c!.from("students").select("*"), c!.from("trial_classes").select("*"),
+      c!.from("bookings").select("*"), c!.from("payment_attempts").select("*"),
+    ]);
+    const tcs = await supaGetTrialClasses();
+    return { parents: parents.data as Parent[] ?? [], students: students.data as Student[] ?? [], trialClasses: tcs, bookings: bookings.data as Booking[] ?? [], payments: payments.data as PaymentAttempt[] ?? [] };
+  },
+  getAllBookingsSync(): Booking[] { return memoryStore.getAllBookings(); },
+  // mutations
+  async reset(): Promise<void> {
+    if (!isSupabaseConfigured()) { memoryStore.reset(); return; }
+    const c = await sb();
+    // delete in FK order: payments -> bookings
+    await c!.from("payment_attempts").delete().neq("id", "");
+    await c!.from("bookings").delete().neq("id", "");
+    // re-seed from memoryStore seed (same data as seed.sql) — reuse its seed logic by inserting
+    // We call memoryStore seed via temporary instance to get data, then insert to Supabase
+    const tmp = new InMemoryStore(); (tmp as any).seed();
+    const d = (tmp as any).dump();
+    // parents/students/classes are static — upsert
+    await c!.from("parents").upsert(d.parents as Parent[]);
+    await c!.from("students").upsert(d.students as Student[]);
+    await c!.from("trial_classes").upsert(d.trialClasses as TrialClass[]);
+    await c!.from("bookings").insert(d.bookings as Booking[]);
+    await c!.from("payment_attempts").insert(d.payments as PaymentAttempt[]);
+  },
+  async createPendingBooking(params: { parent_id: string; student_id: string; trial_class_id: string }): Promise<{ booking: Booking } | { error: string; code: string }> {
+    if (!isSupabaseConfigured()) return memoryStore.createPendingBooking(params);
+    const c = await sb();
+    // validate FK + ownership
+    const { data: parent } = await c!.from("parents").select("*").eq("id", params.parent_id).single();
+    if (!parent) return { error: "Parent not found", code: "PARENT_NOT_FOUND" };
+    const { data: student } = await c!.from("students").select("*").eq("id", params.student_id).single();
+    if (!student) return { error: "Student not found", code: "STUDENT_NOT_FOUND" };
+    if ((student as Student).parent_id !== params.parent_id) return { error: "Student does not belong to parent", code: "FORBIDDEN" };
+    const { data: tc } = await c!.from("trial_classes").select("*").eq("id", params.trial_class_id).single();
+    if (!tc) return { error: "Trial class not found", code: "CLASS_NOT_FOUND" };
+    // duplicate pending/confirmed check
+    const { data: dup } = await c!.from("bookings").select("*").eq("student_id", params.student_id).eq("trial_class_id", params.trial_class_id).in("status", ["pending_payment", "confirmed"]);
+    if (dup && dup.length > 0) return { error: "Duplicate booking: child already has pending/confirmed booking for this class", code: "DUPLICATE_BOOKING" };
+    const now = new Date().toISOString();
+    const id = `bk_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const booking: Booking = { id, student_id: params.student_id, trial_class_id: params.trial_class_id, parent_id: params.parent_id, status: "pending_payment", created_at: now, updated_at: now };
+    const { error } = await c!.from("bookings").insert(booking);
+    if (error) {
+      if ((error as any).code === "23505") return { error: "Duplicate booking", code: "DUPLICATE_BOOKING" };
+      return { error: error.message, code: "BAD_REQUEST" };
+    }
+    return { booking };
+  },
+  async confirmBooking(params: { booking_id: string; provider_ref?: string; amount_cents?: number }): Promise<{ booking: Booking; payment: PaymentAttempt } | { error: string; code: string }> {
+    if (!isSupabaseConfigured()) return memoryStore.confirmBooking(params);
+    const c = await sb();
+    const { data, error } = await c!.rpc("confirm_booking", { p_booking_id: params.booking_id, p_provider_ref: params.provider_ref ?? `mock_${Date.now()}`, p_amount_cents: params.amount_cents ?? 99000 });
+    if (error) {
+      const msg = (error as any).message ?? "";
+      const code = (error as any).code;
+      if (msg.includes("CLASS_FULL") || msg.includes("capacity")) return { error: "Class is full (capacity 4 reached)", code: "CLASS_FULL" };
+      if (code === "23505" || msg.includes("DUPLICATE_BOOKING")) return { error: "Duplicate confirmed booking", code: "DUPLICATE_BOOKING" };
+      if (msg.includes("BOOKING_NOT_FOUND")) return { error: "Booking not found", code: "BOOKING_NOT_FOUND" };
+      if (msg.includes("INVALID_STATUS")) return { error: msg, code: "INVALID_STATUS" };
+      return { error: msg || error.message, code: "BAD_REQUEST" };
+    }
+    // The rpc returns booking_id/new_status; fetch booking + latest payment
+    const booking = await (async () => {
+      const { data } = await c!.from("bookings").select("*").eq("id", params.booking_id).single();
+      return data as Booking;
+    })();
+    const { data: pays } = await c!.from("payment_attempts").select("*").eq("booking_id", params.booking_id).order("created_at", { ascending: false }).limit(1);
+    const payment = (pays as PaymentAttempt[])[0];
+    return { booking, payment };
+  },
+  async failBookingPayment(params: { booking_id: string; reason?: string; provider_ref?: string }): Promise<{ booking: Booking; payment: PaymentAttempt } | { error: string; code: string }> {
+    if (!isSupabaseConfigured()) return memoryStore.failBookingPayment(params);
+    const c = await sb();
+    const { data: booking } = await c!.from("bookings").select("*").eq("id", params.booking_id).single();
+    if (!booking) return { error: "Booking not found", code: "BOOKING_NOT_FOUND" };
+    if ((booking as Booking).status !== "pending_payment") return { error: `Cannot fail payment for booking status ${(booking as Booking).status}`, code: "INVALID_STATUS" };
+    const now = new Date().toISOString();
+    const { error: upErr } = await c!.from("bookings").update({ status: "payment_failed", updated_at: now }).eq("id", params.booking_id);
+    if (upErr) return { error: upErr.message, code: "BAD_REQUEST" };
+    const payment: PaymentAttempt = { id: `pay_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`, booking_id: params.booking_id, status: "failed", amount_cents: 99000, provider_ref: params.provider_ref ?? `mock_fail_${Date.now()}`, created_at: now };
+    const { error: payErr } = await c!.from("payment_attempts").insert(payment);
+    if (payErr) return { error: payErr.message, code: "BAD_REQUEST" };
+    const updated = { ...(booking as Booking), status: "payment_failed" as BookingStatus, updated_at: now };
+    return { booking: updated, payment };
+  },
+  // legacy sync helpers for verify fallback
+  _memoryStore: memoryStore,
+};

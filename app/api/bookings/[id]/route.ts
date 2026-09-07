@@ -13,11 +13,11 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     const parsed = idSchema.safeParse(id);
     if (!parsed.success) throw new AppError("BAD_REQUEST", "Invalid booking id");
 
-    const booking = store.getBooking(id);
+    const booking = await store.getBooking(id);
     if (!booking) throw new AppError("BOOKING_NOT_FOUND", "Booking not found");
 
-    const payments = store.getPaymentsForBooking(id);
-    const trialClass = store.getTrialClass(booking.trial_class_id);
+    const payments = await store.getPaymentsForBooking(id);
+    const trialClass = await store.getTrialClass(booking.trial_class_id);
     return jsonOk({ booking, payments, trialClass });
   } catch (err) {
     return jsonError(err);

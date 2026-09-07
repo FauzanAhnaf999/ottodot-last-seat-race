@@ -1,20 +1,25 @@
 import { store } from "@/lib/store";
+import ResetSeedButton from "@/components/ResetSeedButton";
 
 export const dynamic = "force-dynamic";
 
-export default function RosterPage() {
-  const classes = store.getTrialClasses();
+export default async function RosterPage() {
+  const classes = await store.getTrialClasses();
 
   return (
     <main className="max-w-5xl mx-auto px-6 py-8 space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Class Rosters (Teacher / Admin)</h1>
-        <p className="text-sm text-zinc-600 mt-1">Only <code>confirmed</code> bookings appear. Capacity 4. Pending / failed excluded.</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Class Rosters (Teacher / Admin)</h1>
+          <p className="text-sm text-zinc-600 mt-1">Only <code>confirmed</code> bookings appear. Capacity 4. Pending / failed excluded.</p>
+        </div>
+        <ResetSeedButton />
       </div>
 
       <div className="grid gap-6">
-        {classes.map((c) => {
-          const roster = store.getRoster(c.id);
+        {await Promise.all(
+          classes.map(async (c) => {
+            const roster = await store.getRoster(c.id);
           const paymentsInfo = roster.length ? "" : "";
           return (
             <div key={c.id} className="bg-white border rounded-2xl overflow-hidden shadow-sm">
@@ -72,7 +77,7 @@ export default function RosterPage() {
               )}
             </div>
           );
-        })}
+          }))}
       </div>
 
       <div className="bg-white border rounded-2xl p-5">

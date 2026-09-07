@@ -10,7 +10,7 @@ export async function GET(req: NextRequest) {
   if (parentId) {
     const parsed = idSchema.safeParse(parentId);
     if (!parsed.success) return jsonError(parsed.error);
-    return NextResponse.json({ data: store.getStudentsByParent(parentId) }, { headers: { "cache-control": "no-store" } });
+    return NextResponse.json({ data: await store.getStudentsByParent(parentId) }, { headers: { "cache-control": "no-store" } });
   }
-  return NextResponse.json({ data: store.getStudents() }, { headers: { "cache-control": "no-store" } });
+  return NextResponse.json({ data: await store.getStudents() }, { headers: { "cache-control": "no-store" } });
 }

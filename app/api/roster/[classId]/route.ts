@@ -17,10 +17,10 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ cla
     const parsed = idSchema.safeParse(classId);
     if (!parsed.success) throw new AppError("BAD_REQUEST", "Invalid classId");
 
-    const trialClass = store.getTrialClass(classId);
+    const trialClass = await store.getTrialClass(classId);
     if (!trialClass) throw new AppError("CLASS_NOT_FOUND", "Class not found");
 
-    const roster = store.getRoster(classId);
+    const roster = await store.getRoster(classId);
     return jsonOk({ trialClass, roster, confirmed_count: roster.length, capacity: trialClass.capacity });
   } catch (err) {
     return jsonError(err);

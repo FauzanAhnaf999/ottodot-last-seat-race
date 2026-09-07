@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 // Best practice: compute availability server-side (confirmed_count) — never trust client count.
 // Add cache-control for demo: no-store because bookings are mutable frequently.
 export async function GET() {
-  const classes = store.getTrialClasses();
+  const classes = await store.getTrialClasses();
   return NextResponse.json(
     { data: classes },
     {

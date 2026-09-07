@@ -16,7 +16,13 @@ type TrialClass = {
 
 type Parent = { id: string; name: string; email: string };
 type Student = { id: string; parent_id: string; name: string; age: number };
-type Booking = { id: string; status: string; student_id: string; trial_class_id: string };
+type Booking = { id: string; status: string; student_id: string; trial_class_id: string; created_at: string };
+
+function fmtDate(iso: string) {
+  try {
+    return new Date(iso).toLocaleString("en-ID", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  } catch { return iso; }
+}
 
 export default function Home() {
   const [parents, setParents] = useState<Parent[]>([]);
@@ -30,6 +36,12 @@ export default function Home() {
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [rosterPreview, setRosterPreview] = useState<any>(null);
+  const [bookedStudentName, setBookedStudentName] = useState<string>("");
+  const [bookedClassTitle, setBookedClassTitle] = useState<string>("");
+  const [childBookings, setChildBookings] = useState<Booking[]>([]);
+  const [classBreakdown, setClassBreakdown] = useState<Record<string, number> | null>(null);
+  const [showHelper, setShowHelper] = useState(true);
+  const [toast, setToast] = useState<string>("");
 
   async function refresh() {
     const [pRes, cRes] = await Promise.all([fetch("/api/parents"), fetch("/api/trial-classes")]);
@@ -54,11 +66,36 @@ export default function Home() {
       });
   }, [selectedParent]);
 
+  // fetch bookings for selected child (for per-class badge + history)
+  useEffect(() => {
+    if (!selectedStudent) { setChildBookings([]); return; }
+    fetch(`/api/bookings?studentId=${selectedStudent}`)
+      .then((r) => r.json())
+      .then((j) => setChildBookings(j.data?.bookings ?? []))
+      .catch(() => setChildBookings([]));
+  }, [selectedStudent, booking?.id]);
+
+  // fetch breakdown for selected class (for pending hint)
+  useEffect(() => {
+    if (!selectedClass) { setClassBreakdown(null); setRosterPreview(null); return; }
+    fetch(`/api/bookings?classId=${selectedClass}`)
+      .then((r) => r.json())
+      .then((j) => setClassBreakdown(j.data?.breakdown ?? null))
+      .catch(() => setClassBreakdown(null));
+    fetchRoster(selectedClass);
+  }, [selectedClass]);
+
+  function childStatusFor(classId: string): Booking | undefined {
+    return childBookings.find((b) => b.trial_class_id === classId && (b.status === "pending_payment" || b.status === "confirmed"));
+  }
+
   async function handleCreateBooking() {
     setErrorMsg("");
     setStatusMsg("");
     setLoading(true);
     try {
+      const snapStudentName = students.find((s) => s.id === selectedStudent)?.name ?? selectedStudent;
+      const snapClassTitle = classes.find((c) => c.id === selectedClass)?.title ?? selectedClass;
       const res = await fetch("/api/bookings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -70,11 +107,27 @@ export default function Home() {
       });
       const json = await res.json();
       if (!res.ok) {
-        setErrorMsg(`${json.code ?? "ERROR"}: ${json.error}`);
+        if (json.code === "DUPLICATE_BOOKING") {
+          const existing = childStatusFor(selectedClass);
+          const isSeededDuplicate = selectedStudent === "stu_1" && selectedClass === "cls_available";
+          const hint = isSeededDuplicate
+            ? " Hint: Kiko (stu_1) is the seeded duplicate for Science Explorers — try Milo Rahayu (7y) for this class instead."
+            : existing
+              ? ` You already have ${existing.status} ${existing.id} for this class — use Mock Pay below or pick another child/class.`
+              : "";
+          setErrorMsg(`DUPLICATE_BOOKING: This child already has a pending/confirmed booking for this class.${hint}`);
+          if (existing) setBooking(existing as Booking);
+        } else {
+          setErrorMsg(`${json.code ?? "ERROR"}: ${json.error}`);
+        }
         return;
       }
       setBooking(json.data);
+      setBookedStudentName(snapStudentName);
+      setBookedClassTitle(snapClassTitle);
       setStatusMsg(`Booking created — status: ${json.data.status}. Now simulate payment.`);
+      setToast(`Pending created for ${snapStudentName} → ${snapClassTitle}`);
+      setTimeout(() => setToast(""), 3000);
       refresh();
     } catch (e: any) {
       setErrorMsg(String(e));
@@ -97,18 +150,23 @@ export default function Home() {
       const json = await res.json();
       if (!res.ok) {
         setErrorMsg(`${json.code}: ${json.error}`);
-        // if class full, show that race was prevented
         if (json.code === "CLASS_FULL") {
           setStatusMsg("Payment blocked — class became full. At most 1 seat was given. Try another class.");
         }
         return;
       }
       setBooking(json.data);
-      setStatusMsg(`Payment ${simulate} → booking status: ${json.data.status}`);
+      const msg = simulate === "success" ? `✓ Confirmed! ${bookedStudentName || "Child"} is now on the roster for ${bookedClassTitle || selectedClass}` : `Payment failed — ${bookedStudentName || "Child"} not added to roster (you can retry with a new booking)`;
+      setStatusMsg(msg);
+      setToast(msg);
+      setTimeout(() => setToast(""), 4000);
       refresh();
       if (selectedClass) {
         const r = await fetch(`/api/roster/${selectedClass}`).then((x) => x.json());
         setRosterPreview(r.data);
+        // also refresh breakdown
+        const b = await fetch(`/api/bookings?classId=${selectedClass}`).then((x) => x.json());
+        setClassBreakdown(b.data?.breakdown ?? null);
       }
     } catch (e: any) {
       setErrorMsg(String(e));
@@ -123,16 +181,35 @@ export default function Home() {
   }
 
   const selectedClassObj = classes.find((c) => c.id === selectedClass);
+  const isSelectedFull = !!selectedClassObj?.is_full;
+  const selectedChildObj = students.find((s) => s.id === selectedStudent);
+  const childStatus = selectedClass ? childStatusFor(selectedClass) : undefined;
 
   return (
     <main className="max-w-5xl mx-auto px-6 py-8">
+      <div className="mb-4 bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-2.5 text-xs text-emerald-900">
+        <span className="font-semibold">Vercel is Supabase-backed (persistent)</span> — race now uses Postgres <code>confirm_booking() FOR UPDATE</code> (<code>supabase/schema.sql</code>). 2-tab race works across lambdas. Local fallback is still in-memory: <code className="bg-white border px-1 py-0.5 rounded">pnpm dev</code> + <code className="bg-white border px-1 py-0.5 rounded">pnpm verify</code> / <code className="bg-white border px-1 py-0.5 rounded">pnpm race</code>.
+      </div>
+      {showHelper && (
+        <div className="mb-6 bg-sky-50 border border-sky-200 rounded-2xl px-4 py-3 flex items-start gap-3">
+          <div className="text-sky-700 text-sm flex-1">
+            <span className="font-semibold">First time? Try this:</span> Pick <b>Siti Rahayu → Milo Rahayu (7y) → Science Explorers 0/4</b> → Create → Mock Pay Success. <span className="text-zinc-600">Kiko is the intentional duplicate example for this class — that is why Milo works.</span>
+          </div>
+          <button onClick={() => setShowHelper(false)} className="text-xs text-sky-700 border border-sky-300 rounded-full px-2.5 py-1 hover:bg-sky-100">Dismiss</button>
+        </div>
+      )}
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 bg-zinc-900 text-white text-sm px-4 py-3 rounded-xl shadow-lg border border-zinc-800 max-w-sm">
+          {toast}
+        </div>
+      )}
       <div className="grid lg:grid-cols-[1.1fr_0.9fr] gap-8">
         {/* Left: booking form */}
         <div className="space-y-6">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Book a trial class</h1>
             <p className="text-sm text-zinc-600 mt-1">
-              Choose child → pick class → mock payment. Roster only adds confirmed bookings. Capacity is 4.
+              Choose child → pick class → mock payment. <b>Roster only counts confirmed</b> — pending/failed never take a seat. Capacity is 4.
             </p>
           </div>
 
@@ -143,14 +220,16 @@ export default function Home() {
                 <select
                   value={selectedParent}
                   onChange={(e) => setSelectedParent(e.target.value)}
-                  className="w-full border rounded-lg px-3 py-2 text-sm bg-white"
+                  className="w-full border rounded-lg px-3 py-2 text-sm bg-white truncate"
+                  title={parents.find((p) => p.id === selectedParent)?.email ?? ""}
                 >
                   {parents.map((p) => (
                     <option key={p.id} value={p.id}>
-                      {p.name} — {p.email}
+                      {p.name}
                     </option>
                   ))}
                 </select>
+                <div className="text-[11px] text-zinc-500 truncate">{parents.find((p) => p.id === selectedParent)?.email ?? ""}</div>
               </label>
 
               <label className="space-y-1">
@@ -166,56 +245,110 @@ export default function Home() {
                     </option>
                   ))}
                 </select>
+                {childBookings.length > 0 && (
+                  <div className="text-[11px] text-zinc-500">
+                    This child has {childBookings.filter((b) => b.status === "pending_payment").length} pending • {childBookings.filter((b) => b.status === "confirmed").length} confirmed
+                  </div>
+                )}
               </label>
             </div>
 
-            <div className="space-y-2">
-              <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Available trial classes</div>
-              <div className="grid gap-2">
-                {classes.map((c) => (
-                  <label
-                    key={c.id}
-                    className={`flex items-center gap-3 border rounded-xl px-4 py-3 cursor-pointer transition ${
-                      selectedClass === c.id ? "border-zinc-900 bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50"
-                    } ${c.is_full ? "opacity-60" : ""}`}
-                  >
-                    <input
-                      type="radio"
-                      name="trialClass"
-                      checked={selectedClass === c.id}
-                      onChange={() => {
-                        setSelectedClass(c.id);
-                        fetchRoster(c.id);
-                      }}
-                      className="accent-zinc-900"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate">{c.title}</div>
-                      <div
-                        className={`text-xs ${selectedClass === c.id ? "text-zinc-300" : "text-zinc-500"} flex gap-2 flex-wrap`}
-                      >
-                        <span>{c.teacher_name}</span>
-                        <span>•</span>
-                        <span>{new Date(c.starts_at).toLocaleString()}</span>
-                        <span>•</span>
-                        <span className={c.is_full ? "text-red-500 font-semibold" : ""}>
-                          {c.confirmed_count}/{c.capacity} confirmed • {c.available_seats} seat(s) left{" "}
-                          {c.is_full && "— FULL"}
-                        </span>
-                      </div>
-                    </div>
-                  </label>
-                ))}
+            {/* Child history mini — clarity */}
+            {selectedStudent && childBookings.length > 0 && (
+              <div className="bg-zinc-50 border rounded-xl px-3 py-2">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 mb-1">This child's bookings</div>
+                <ul className="space-y-1">
+                  {childBookings.slice(0, 3).map((b) => {
+                    const cls = classes.find((c) => c.id === b.trial_class_id)?.title ?? b.trial_class_id;
+                    return (
+                      <li key={b.id} className="flex items-center gap-2 text-xs">
+                        <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-medium ${b.status === "confirmed" ? "bg-emerald-100 text-emerald-700" : b.status === "pending_payment" ? "bg-amber-100 text-amber-700" : b.status === "payment_failed" ? "bg-red-100 text-red-700" : "bg-zinc-200"}`}>{b.status}</span>
+                        <span className="truncate">{cls}</span>
+                        <span className="text-zinc-400">{new Date(b.created_at).toLocaleDateString()}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
               </div>
+            )}
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Available trial classes</div>
+                {classBreakdown && selectedClass && (
+                  <div className="text-[11px] text-zinc-500">
+                    {classBreakdown.confirmed} confirmed • {classBreakdown.pending_payment} pending • {classBreakdown.payment_failed} failed
+                  </div>
+                )}
+              </div>
+              <div className="grid gap-2">
+                {classes.map((c) => {
+                  const status = childStatusFor(c.id);
+                  const isSelected = selectedClass === c.id;
+                  return (
+                    <label
+                      key={c.id}
+                      className={`flex items-center gap-3 border rounded-xl px-4 py-3 transition ${
+                        c.is_full ? "opacity-40 cursor-not-allowed bg-zinc-50" : "cursor-pointer"
+                      } ${isSelected ? "border-zinc-900 bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50"}`}
+                    >
+                      <input
+                        type="radio"
+                        name="trialClass"
+                        disabled={c.is_full}
+                        checked={isSelected}
+                        onChange={() => {
+                          if (c.is_full) return;
+                          setSelectedClass(c.id);
+                        }}
+                        className="accent-zinc-900 disabled:opacity-50"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <div className="text-sm font-medium truncate">{c.title}</div>
+                          {status && (
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${status.status === "confirmed" ? "bg-emerald-500 text-white" : "bg-amber-500 text-white"}`}>
+                              {status.status === "confirmed" ? "You’re confirmed" : "You have pending"}
+                            </span>
+                          )}
+                        </div>
+                        <div className={`text-xs ${isSelected ? "text-zinc-300" : "text-zinc-500"} flex gap-2 flex-wrap items-center`}>
+                          <span>{c.teacher_name}</span>
+                          <span>•</span>
+                          <span>{fmtDate(c.starts_at)}</span>
+                          <span>•</span>
+                          <span className={c.is_full ? "text-red-500 font-semibold" : ""}>
+                            {c.confirmed_count}/{c.capacity} confirmed • {c.available_seats} left {c.is_full && "— FULL"}
+                          </span>
+                        </div>
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+              {selectedChildObj && selectedClassObj && childStatus && (
+                <div className="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-3 py-2">
+                  ⓘ {selectedChildObj.name} already has <b>{childStatus.status}</b> for {selectedClassObj.title} ({childStatus.id}). {childStatus.status === "pending_payment" ? "Pay it below or pick another child/class." : "Pick another child or class."}
+                </div>
+              )}
+              {selectedClassObj && classBreakdown && (
+                <div className="text-[11px] text-zinc-500 bg-zinc-50 border rounded-lg px-3 py-2">
+                  Roster counts <b>only confirmed</b>: {classBreakdown.confirmed} confirmed on roster • {classBreakdown.pending_payment} pending (not counted) • {classBreakdown.payment_failed} failed (can retry)
+                </div>
+              )}
             </div>
 
             <button
               onClick={handleCreateBooking}
-              disabled={!selectedParent || !selectedStudent || !selectedClass || loading}
+              disabled={!selectedParent || !selectedStudent || !selectedClass || loading || isSelectedFull || !!childStatus}
               className="w-full bg-orange-600 text-white rounded-full py-2.5 text-sm font-medium hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              title={isSelectedFull ? "Class is full (4/4) — pick another class" : childStatus ? `Already ${childStatus.status} for this child+class` : undefined}
             >
-              {loading ? "Processing…" : "Create pending booking"}
+              {isSelectedFull ? "Class full — pick another" : childStatus ? `${childStatus.status === "confirmed" ? "Already confirmed" : "Already pending"} — pick another` : loading ? "Processing…" : "Create pending booking"}
             </button>
+            {isSelectedFull && (
+              <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">This class is full (4/4). Roster is at capacity — please pick another trial class.</div>
+            )}
 
             {errorMsg && (
               <div className="text-sm bg-red-50 border border-red-200 text-red-700 rounded-lg px-3 py-2">{errorMsg}</div>
@@ -245,7 +378,7 @@ export default function Home() {
                   </span>
                 </div>
                 <div className="text-xs text-zinc-600">
-                  Child: {students.find((s) => s.id === booking.student_id)?.name} • Class: {selectedClassObj?.title}
+                  Child: {bookedStudentName || students.find((s) => s.id === booking.student_id)?.name || booking.student_id} • Class: {bookedClassTitle || selectedClassObj?.title || booking.trial_class_id}
                 </div>
                 {booking.status === "pending_payment" && (
                   <div className="flex gap-2">
@@ -265,6 +398,12 @@ export default function Home() {
                     </button>
                   </div>
                 )}
+                {booking.status === "confirmed" && (
+                  <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">✓ On the roster now. Check Roster preview on the right or <a href="/roster" className="underline">View all rosters</a>.</div>
+                )}
+                {booking.status === "payment_failed" && (
+                  <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">Not on roster — you can create a new pending booking for this child+class to retry.</div>
+                )}
                 <a href={`/api/bookings/${booking.id}`} target="_blank" className="text-xs underline text-zinc-500">
                   View booking JSON
                 </a>
@@ -276,21 +415,19 @@ export default function Home() {
             <h3 className="font-medium text-sm">Edge cases to try</h3>
             <ul className="text-xs text-zinc-600 list-disc pl-4 space-y-1">
               <li>
-                <b>Available:</b> cls_available has 0 confirmed → try booking Milo Rahayu there.
+                <b>Available:</b> Science Explorers 0/4 → try <b>Milo Rahayu</b> there (Kiko is the seeded duplicate, so Milo shows the happy path).
               </li>
               <li>
-                <b>3/4 full:</b> cls_almost_full has 3/4 → only 1 seat left. Create 2 pending bookings for 2 different
-                kids and race their payments (see script below).
+                <b>3/4 full:</b> Math Masters 3/4 → only 1 seat left. Create 2 pending for 2 different kids and race their payments (see script below).
               </li>
               <li>
-                <b>Duplicate:</b> Kiko (stu_1) already has pending for cls_available → try again → expects 409.
+                <b>Duplicate:</b> Kiko (stu_1) already has pending for Science Explorers → try again → expects 409. The UI now says “try Milo”.
               </li>
               <li>
-                <b>Payment fail:</b> create booking then “Mock Pay Fail” → status payment_failed, NOT on roster.
+                <b>Payment fail:</b> create booking then “Mock Pay Fail” → status payment_failed, NOT on roster (check preview: pending not counted).
               </li>
               <li>
-                <b>Last-seat race:</b> use cls_race (also 3/4). Open two tabs or run:{" "}
-                <code className="bg-zinc-100 px-1 py-0.5 rounded">pnpm run race</code>
+                <b>Last-seat race:</b> use Space Lab 3/4. Open two tabs or run: <code className="bg-zinc-100 px-1 py-0.5 rounded">pnpm race</code>
               </li>
             </ul>
             <div className="flex gap-2">
@@ -301,6 +438,8 @@ export default function Home() {
                   setBooking(null);
                   setStatusMsg("Seed reset — back to initial state.");
                   setErrorMsg("");
+                  setToast("Seed reset");
+                  setTimeout(() => setToast(""), 2000);
                 }}
                 className="text-xs border px-3 py-1.5 rounded-full hover:bg-zinc-50"
               >
@@ -350,13 +489,21 @@ export default function Home() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="font-medium text-sm">Roster preview</h3>
                 <span className="text-xs px-2 py-1 bg-zinc-900 text-white rounded-full">
-                  {rosterPreview.confirmed_count}/{rosterPreview.capacity}
+                  {rosterPreview.confirmed_count}/{rosterPreview.capacity} confirmed
                 </span>
               </div>
-              <div className="text-xs text-zinc-500 mb-2">{rosterPreview.trialClass.title}</div>
+              <div className="text-xs text-zinc-500 mb-2">{rosterPreview.trialClass.title} • Roster is <b>only confirmed</b></div>
+              {classBreakdown && (
+                <div className="text-[11px] text-zinc-500 bg-zinc-50 border rounded-lg px-2 py-1.5 mb-3">
+                  Breakdown: {classBreakdown.confirmed} confirmed (on roster) • {classBreakdown.pending_payment} pending (not counted) • {classBreakdown.payment_failed} failed
+                </div>
+              )}
               {rosterPreview.roster.length === 0 ? (
                 <div className="text-sm text-zinc-500 py-4 text-center border rounded-xl border-dashed">
                   No confirmed students yet.
+                  {classBreakdown && classBreakdown.pending_payment > 0 && (
+                    <div className="text-xs mt-1">There is {classBreakdown.pending_payment} pending booking not on roster yet.</div>
+                  )}
                 </div>
               ) : (
                 <ul className="space-y-2">
