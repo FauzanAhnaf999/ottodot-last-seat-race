@@ -1,11 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { store } from "@/lib/store";
+import { idSchema } from "@/lib/validation";
+import { jsonError } from "@/lib/api";
+
+export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const parentId = req.nextUrl.searchParams.get("parentId");
   if (parentId) {
-    const students = store.getStudentsByParent(parentId);
-    return NextResponse.json({ data: students });
+    const parsed = idSchema.safeParse(parentId);
+    if (!parsed.success) return jsonError(parsed.error);
+    return NextResponse.json({ data: store.getStudentsByParent(parentId) }, { headers: { "cache-control": "no-store" } });
   }
-  return NextResponse.json({ data: store.getStudents() });
+  return NextResponse.json({ data: store.getStudents() }, { headers: { "cache-control": "no-store" } });
 }

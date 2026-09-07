@@ -3,19 +3,28 @@ import {
   BookingStatus,
   Parent,
   PaymentAttempt,
-  PaymentStatus,
   RosterEntry,
   Student,
   TrialClass,
   TrialClassWithAvailability,
 } from "./types";
 
+// ---------------------------------------------------------------------------
+// InMemoryStore — domain service + repository in one for the demo slice.
+// Production mapping (see README “Architecture”):
+//   UI / API Route  →  BookingService (this file)  →  Postgres + confirm_booking()
+//   Validation (zod) → Business invariants → Transaction (FOR UPDATE / mutex)
+// Best practice: all invariants live here, routes are thin controllers.
+// ---------------------------------------------------------------------------
 // Simple in-memory store that mimics Postgres transactional semantics.
 // For production Supabase/Postgres, the same invariants are enforced via
 // SQL transactions with SELECT ... FOR UPDATE (see supabase/schema.sql).
 //
 // Concurrency control: per-class mutex serializes confirm operations,
 // exactly analogous to row-level locking on trial_classes in Postgres.
+// Why per-class? Capacity is per trial_classes.id — serializing globally
+// would needlessly block unrelated classes. Row-level lock gives max concurrency.
+// ---------------------------------------------------------------------------
 
 type StoreState = {
   parents: Map<string, Parent>;
@@ -286,7 +295,26 @@ class InMemoryStore {
   }
 
   private genId(prefix: string) {
-    return `${prefix}_${Math.random().toString(36).slice(2, 9)}_${Date.now().toString(36)}`;
+    // Best practice: use crypto.randomUUID (RFC4122 v4) — collision-safe,
+    // lexicographically sortable when needed use ulid; avoids Math.random bias.
+    // Prefix keeps IDs human-scannable in logs (bk_, pay_) without losing entropy.
+    return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  }
+
+  // Debug/observability helper — replaces leaky (store as any).state access
+  // Best practice: repository never exposes internal Map; expose projection instead.
+  dump() {
+    return {
+      parents: [...this.state.parents.values()],
+      students: [...this.state.students.values()],
+      trialClasses: [...this.state.trialClasses.values()],
+      bookings: [...this.state.bookings.values()],
+      payments: [...this.state.payments.values()],
+    };
+  }
+
+  getAllBookings(): Booking[] {
+    return [...this.state.bookings.values()];
   }
 
   countConfirmed(classId: string): number {
@@ -371,8 +399,15 @@ class InMemoryStore {
     return [...this.state.payments.values()].filter((p) => p.booking_id === bookingId);
   }
 
-  // Create pending booking. Does NOT check capacity (capacity is enforced at confirm time).
-  // But prevents duplicate active bookings (pending_payment or confirmed) for same student+class.
+  // Create pending booking — thin, fast, no lock.
+  // Best practice: keep creation cheap & non-blocking; capacity is checked only
+  // at confirm time to avoid holding inventory for abandoners.
+  // Invariants enforced here (fail-fast, no DB lock needed):
+  //  - FK existence (parents, students, trial_classes)
+  //  - Authorization: student.parent_id === parent_id (otherwise FORBIDDEN)
+  //  - Idempotency guard: reject if pending_payment|confirmed exists for (student, class)
+  //    Note: payment_failed/cancelled do NOT block — allows retry, matches product spec.
+  // Returns 409 DUPLICATE_BOOKING on double-submit (double-click safe).
   createPendingBooking(params: {
     parent_id: string;
     student_id: string;
@@ -413,17 +448,22 @@ class InMemoryStore {
     return { booking };
   }
 
-  // Confirm booking with transactional semantics.
-  // This is the critical section that must be atomic.
-  // In Postgres this would be:
+  // Confirm booking — THE critical section. Must be atomic.
+  // Best practice: “check-then-act” must be inside a single transaction/lock.
+  // Naive read-then-write (read available=1, both write) → 5/4 overbooking bug.
+  // Correct: serialize per class, re-read inside lock, then decide.
+  // Postgres equivalent (see supabase/schema.sql confirm_booking()):
   //   BEGIN;
-  //   SELECT * FROM trial_classes WHERE id = $1 FOR UPDATE;
-  //   SELECT COUNT(*) FROM bookings WHERE trial_class_id=$1 AND status='confirmed' FOR UPDATE;
-  //   -- check duplicate unique partial index
-  //   -- check capacity < 4
+  //   SELECT * FROM trial_classes WHERE id = $1 FOR UPDATE; -- row lock = mutexFor(classId)
+  //   SELECT COUNT(*) FROM bookings WHERE trial_class_id=$1 AND status='confirmed';
+  //   -- 1) duplicate confirmed? → 409 DUPLICATE_BOOKING (also partial unique index)
+  //   -- 2) capacity >= 4?     → 409 CLASS_FULL
   //   UPDATE bookings SET status='confirmed' WHERE id=$2;
-  //   INSERT INTO payment_attempts ...
+  //   INSERT INTO payment_attempts ... status='succeeded'
   //   COMMIT;
+  // In-memory analog: per-class Mutex (row-level lock). Holds lock ONLY for
+  // local DB work — payment provider call stays OUTSIDE the lock (see api/pay route).
+  // Idempotent: re-confirming an already-confirmed booking returns same payment.
   async confirmBooking(params: {
     booking_id: string;
     provider_ref?: string;
@@ -500,7 +540,10 @@ class InMemoryStore {
     }
   }
 
-  // Mark payment as failed (no seat taken)
+  // Mark payment as failed — terminal, no seat taken.
+  // Best practice: roster query is WHERE status='confirmed' only, so failed
+  // bookings never affect capacity. Keep audit trail in payment_attempts.
+  // Allows retry: new pending can be created for same (student,class) after failure.
   async failBookingPayment(params: {
     booking_id: string;
     reason?: string;
